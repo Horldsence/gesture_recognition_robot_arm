@@ -1,6 +1,13 @@
-"""Serial communication with response handling."""
+"""Serial communication for robotic arm servo controller.
 
-import struct
+Protocol examples:
+- Single: #000P1500T1000!
+- Multi: {G0000#000P1602T1000!#001P2500T0000!#002P1500T1000!}
+
+"#" and "!" are fixed tokens.
+ID is 3 digits (0-254), PWM is 4 digits (500-2500), TIME is 4 digits (0-9999 ms).
+"""
+
 import threading
 import time
 
@@ -13,20 +20,28 @@ except ImportError:
 
 
 class SerialCommunicator:
-    """Send position data and read responses from mechanical arm."""
+    """Send servo PWM commands and optionally read responses."""
 
-    FRAME_SIZE = 11
-
-    def __init__(self, port="/dev/tty0", baudrate=115200, timeout=0.5):
+    def __init__(
+        self,
+        port="/dev/ttyUSB0",
+        baudrate=115200,
+        timeout=0.5,
+        servo_ids=(0, 1, 2, 3),
+        default_time_ms=150,
+    ):
         if not SERIAL_AVAILABLE:
             raise RuntimeError("pyserial not available. Install: pip install pyserial")
 
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self.servo_ids = tuple(int(i) for i in servo_ids)
+        self.default_time_ms = int(default_time_ms)
         self.conn = None
         self._error_flag = False
         self._last_response = ""
+        self._last_command = ""
         self._lock = threading.Lock()
 
         self._open()
@@ -45,67 +60,90 @@ class SerialCommunicator:
         except serial.SerialException as e:
             raise RuntimeError(f"Failed to open {self.port}: {e}")
 
-    def _encode_frame(self, x, y, z, a):
-        """Encode 11-byte frame: [0xAA][X_L][X_H][Y_L][Y_H][Z_L][Z_H][A_L][A_H][checksum][0x55]"""
-        x = max(-500, min(500, int(x)))
-        y = max(-500, min(500, int(y)))
-        z = max(0, min(1000, int(z)))
-        a = max(-180, min(180, int(a)))
+    @staticmethod
+    def _format_id(servo_id: int) -> str:
+        servo_id = int(servo_id)
+        if not (0 <= servo_id <= 254):
+            raise ValueError(f"servo_id out of range (0-254): {servo_id}")
+        return f"{servo_id:03d}"
 
-        xb = struct.pack("<h", x)
-        yb = struct.pack("<h", y)
-        zb = struct.pack("<h", z)
-        ab = struct.pack("<h", a)
+    @staticmethod
+    def _format_pwm(pwm: int) -> str:
+        pwm = int(pwm)
+        pwm = max(500, min(2500, pwm))
+        return f"{pwm:04d}"
 
-        frame = bytearray(9)
-        frame[0] = 0xAA
-        frame[1:3] = xb
-        frame[3:5] = yb
-        frame[5:7] = zb
-        frame[7:9] = ab
+    @staticmethod
+    def _format_time_ms(time_ms: int) -> str:
+        time_ms = int(time_ms)
+        time_ms = max(0, min(9999, time_ms))
+        return f"{time_ms:04d}"
 
-        checksum = sum(frame) & 0xFF
-        frame.append(checksum)
-        frame.append(0x55)
+    def build_single_command(self, servo_id: int, pwm: int, time_ms: int) -> str:
+        """Build a single servo command like: #000P1500T1000!"""
+        sid = self._format_id(servo_id)
+        pwm_s = self._format_pwm(pwm)
+        t_s = self._format_time_ms(time_ms)
+        return f"#{sid}P{pwm_s}T{t_s}!"
 
-        return bytes(frame)
+    def build_group_command(self, commands: list[str]) -> str:
+        """Build multi-servo command. If 2+ commands, wrap with {G0000...}."""
+        if not commands:
+            return ""
+        if len(commands) == 1:
+            return commands[0]
+        return "{G0000" + "".join(commands) + "}"
+
+    def _send_raw(self, command: str):
+        if not self.conn or not self.conn.is_open:
+            raise RuntimeError("Serial not connected")
+
+        self._last_command = command
+        payload = command.encode("ascii", errors="ignore")
+        self.conn.write(payload)
+        self.conn.flush()
 
     def send_and_read(self, x, y, z, a):
-        """Send position and read response.
+        """Send 4-channel PWM values and read response (if any).
 
-        Returns: (success, response, frame_hex)
+        Notes:
+        - This keeps the legacy method signature used by main.py.
+        - x/y/z/a are treated as PWM values (500-2500).
+
+        Returns: (success, response, command_string)
         """
         with self._lock:
             if not self.conn or not self.conn.is_open:
                 return False, "Serial not connected", None
 
             try:
-                frame = self._encode_frame(x, y, z, a)
-                self.conn.write(frame)
-                self.conn.flush()
+                time_ms = self.default_time_ms
+                pwms = [x, y, z, a]
 
-                frame_hex = " ".join(f"{b:02X}" for b in frame)
+                commands = []
+                for idx in range(min(len(self.servo_ids), len(pwms))):
+                    servo_id = self.servo_ids[idx]
+                    pwm = pwms[idx]
+                    commands.append(self.build_single_command(servo_id, pwm, time_ms))
 
-                time.sleep(0.05)
+                group = self.build_group_command(commands)
+                self._send_raw(group)
 
-                if self.conn.in_waiting > 0:
+                time.sleep(0.02)
+                response = ""
+                if getattr(self.conn, "in_waiting", 0) > 0:
                     response = self.conn.read(self.conn.in_waiting).decode(
                         "utf-8", errors="ignore"
                     )
-                    self._last_response = response.strip()
+                self._last_response = response.strip()
 
-                    if "ERR:" in response:
-                        self._error_flag = True
-                        return False, self._last_response, frame_hex
-                    elif "OK" in response:
-                        self._error_flag = False
-                        return True, self._last_response, frame_hex
-                    else:
-                        return True, self._last_response, frame_hex
-
-                return True, "No response", frame_hex
+                self._error_flag = False
+                return True, (self._last_response or "No response"), group
 
             except serial.SerialException as e:
+                self._error_flag = True
+                return False, str(e), None
+            except Exception as e:
                 self._error_flag = True
                 return False, str(e), None
 
@@ -119,6 +157,31 @@ class SerialCommunicator:
 
     def get_last_response(self):
         return self._last_response
+
+    def get_last_command(self):
+        return self._last_command
+
+    def reset_all(self, pwm=1500, time_ms=1000):
+        """Reset all configured servos to a given PWM (default 1500) in one command."""
+        with self._lock:
+            if not self.conn or not self.conn.is_open:
+                return False, "Serial not connected", None
+
+            try:
+                commands = [
+                    self.build_single_command(servo_id, pwm, time_ms)
+                    for servo_id in self.servo_ids
+                ]
+                group = self.build_group_command(commands)
+                self._send_raw(group)
+                self._error_flag = False
+                return True, "OK", group
+            except serial.SerialException as e:
+                self._error_flag = True
+                return False, str(e), None
+            except Exception as e:
+                self._error_flag = True
+                return False, str(e), None
 
     def is_connected(self):
         return self.conn is not None and self.conn.is_open

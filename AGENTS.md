@@ -91,7 +91,7 @@ python3 tests/test_frame_encoding.py
 ## NOTES
 
 - **Hardware lock**: PiCamera2 only works on Raspberry Pi
-- **Serial port**: Hardcoded `/dev/tty0` in `serial_comm.py:20`
+- **Serial port**: Default `/dev/ttyUSB0` (see `SerialCommunicator(port=...)`)
 - **Gesture thresholds**: `movement_threshold=0.02`, `size_threshold=0.05` (gesture_detector.py:49-50)
 - **Send interval**: 150ms (`send_interval=0.15` in main.py:87)
 - **No package config**: Missing pyproject.toml, setup.py

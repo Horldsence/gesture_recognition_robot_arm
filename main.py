@@ -17,12 +17,15 @@ class PositionAccumulator:
     """Accumulate position based on gestures. Stop on serial error."""
 
     STEP_SIZE = 10
+    PWM_MIN = 500
+    PWM_MAX = 2500
+    PWM_CENTER = 1500
 
     def __init__(self):
-        self.x = 0
-        self.y = 0
-        self.z = 500
-        self.a = 0
+        self.x = self.PWM_CENTER
+        self.y = self.PWM_CENTER
+        self.z = self.PWM_CENTER
+        self.a = self.PWM_CENTER
         self._error = False
 
     def update(self, gesture):
@@ -33,22 +36,22 @@ class PositionAccumulator:
         changed = False
 
         if gesture == GestureDetector.FORWARD:
-            self.z = max(0, self.z - self.STEP_SIZE)
+            self.z = max(self.PWM_MIN, self.z - self.STEP_SIZE)
             changed = True
         elif gesture == GestureDetector.BACKWARD:
-            self.z = min(1000, self.z + self.STEP_SIZE)
+            self.z = min(self.PWM_MAX, self.z + self.STEP_SIZE)
             changed = True
         elif gesture == GestureDetector.LEFT:
-            self.x = max(-500, self.x - self.STEP_SIZE)
+            self.x = max(self.PWM_MIN, self.x - self.STEP_SIZE)
             changed = True
         elif gesture == GestureDetector.RIGHT:
-            self.x = min(500, self.x + self.STEP_SIZE)
+            self.x = min(self.PWM_MAX, self.x + self.STEP_SIZE)
             changed = True
         elif gesture == GestureDetector.UP:
-            self.y = min(500, self.y + self.STEP_SIZE)
+            self.y = min(self.PWM_MAX, self.y + self.STEP_SIZE)
             changed = True
         elif gesture == GestureDetector.DOWN:
-            self.y = max(-500, self.y - self.STEP_SIZE)
+            self.y = max(self.PWM_MIN, self.y - self.STEP_SIZE)
             changed = True
 
         return changed
@@ -60,10 +63,10 @@ class PositionAccumulator:
         return self._error
 
     def reset(self):
-        self.x = 0
-        self.y = 0
-        self.z = 500
-        self.a = 0
+        self.x = self.PWM_CENTER
+        self.y = self.PWM_CENTER
+        self.z = self.PWM_CENTER
+        self.a = self.PWM_CENTER
         self._error = False
 
     def get(self):
@@ -150,10 +153,10 @@ class GestureApp:
         self.pos_labels = {}
         for i, (name, key, rng) in enumerate(
             [
-                ("X", "x", "-500~500"),
-                ("Y", "y", "-500~500"),
-                ("Z", "z", "0~1000"),
-                ("A", "a", "-180~180"),
+                ("X", "x", "500~2500"),
+                ("Y", "y", "500~2500"),
+                ("Z", "z", "500~2500"),
+                ("A", "a", "500~2500"),
             ]
         ):
             ttk.Label(pos_frame, text=f"{name}:").grid(row=i, column=0, sticky=tk.W)
@@ -224,7 +227,8 @@ class GestureApp:
             self.status.config(text="状态: 错误", foreground="red")
         else:
             self.error_label.config(text="")
-            self.status.config(text="状态: 运行中", foreground="green")
+            if self.running:
+                self.status.config(text="状态: 运行中", foreground="green")
 
     def _start(self):
         try:
@@ -238,13 +242,14 @@ class GestureApp:
             self._log("手势检测: MediaPipe")
 
             try:
-                self.serial = SerialCommunicator()
-                self._log("串口: /dev/tty0 @ 115200")
+                self.serial = SerialCommunicator(port="/dev/ttyUSB0")
+                self._log("串口: /dev/ttyUSB0 @ 115200")
             except RuntimeError as e:
                 self._log(f"警告: 串口失败 - {e}")
                 self.serial = None
 
             self.accumulator.reset()
+            self._update_pos(1500, 1500, 1500, 1500)
             self.running = True
             self.thread = threading.Thread(target=self._loop, daemon=True)
             self.thread.start()
@@ -278,11 +283,16 @@ class GestureApp:
 
     def _reset(self):
         self.accumulator.reset()
-        self._update_pos(0, 0, 500, 0)
+        self._update_pos(1500, 1500, 1500, 1500)
         self._update_error(False)
         self._log("位置已复位")
         if self.serial:
             self.serial.clear_error()
+            ok, resp, cmd = self.serial.reset_all(pwm=1500, time_ms=1000)
+            if ok:
+                self._log(f"复位指令: {cmd}")
+            else:
+                self._log(f"复位失败: {resp}")
 
     def _cleanup(self):
         if self.camera:
@@ -340,7 +350,10 @@ class GestureApp:
             self.accumulator.set_error(False)
             self.root.after(0, lambda: self._update_error(False))
             self.root.after(
-                0, lambda: self._log(f"发送: X={x} Y={y} Z={z} A={a} | {resp}")
+                0,
+                lambda: self._log(
+                    f"发送: X={x} Y={y} Z={z} A={a} | 指令={frame_hex} | {resp}"
+                ),
             )
         else:
             self.accumulator.set_error(True)
